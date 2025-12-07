@@ -1,4 +1,4 @@
 # Purpose: run spec against Postgres
 defmodule Scout.AdapterSpecPostgresTest do
-  use Scout.AdapterSpec, adapter: Scout.Store.Postgres
+  use Scout.AdapterSpec, adapter: Scout.Store.Postgres, tags: [:postgres]
 end

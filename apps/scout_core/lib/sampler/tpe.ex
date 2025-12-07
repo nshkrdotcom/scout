@@ -2,13 +2,13 @@ defmodule Scout.Sampler.TPE do
   @behaviour Scout.Sampler
   @moduledoc """
   Tree-structured Parzen Estimator with multivariate support.
-  
+
   This implementation includes correlation modeling via Gaussian copula,
   achieving parity with Optuna's multivariate TPE. Proven to achieve:
   - 88% improvement on Rastrigin
   - 555% improvement on Rosenbrock (beats Optuna)
   - 1648% improvement on Himmelblau
-  
+
   Falls back to Random until `min_obs`.
   """
   alias Scout.Sampler.Random
@@ -21,46 +21,51 @@ defmodule Scout.Sampler.TPE do
       bw_floor: Map.get(opts, :bw_floor, 1.0e-3),
       goal: Map.get(opts, :goal, :maximize),
       seed: Map.get(opts, :seed),
-      multivariate: Map.get(opts, :multivariate, true),  # Enable by default
-      bandwidth_factor: Map.get(opts, :bandwidth_factor, 1.06),  # Scott's rule
-      rng_state: nil  # Will be seeded per trial
+      # Enable by default
+      multivariate: Map.get(opts, :multivariate, true),
+      # Scott's rule
+      bandwidth_factor: Map.get(opts, :bandwidth_factor, 1.06),
+      # Will be seeded per trial
+      rng_state: nil
     }
   end
 
   def next(space_fun, ix, history, state) do
     # Initialize RNG state if not set
-    rng_state = if state.rng_state do
-      state.rng_state
-    else
-      if state.seed do
-        :rand.seed_s(:exsplus, {state.seed, ix, 1337})
+    rng_state =
+      if state.rng_state do
+        state.rng_state
       else
-        :rand.export_seed()
+        if state.seed do
+          :rand.seed_s(:exsplus, {state.seed, ix, 1337})
+        else
+          :rand.export_seed()
+        end
       end
-    end
-    
+
     if length(history) < state.min_obs do
       Random.next(space_fun, ix, history, state)
     else
       spec = space_fun.(ix)
-      
+
       # Separate numeric and categorical parameters
       numeric_specs = for {k, {:uniform, _, _}} <- spec, do: {k, spec[k]}
-      numeric_specs = numeric_specs ++ (for {k, {:log_uniform, _, _}} <- spec, do: {k, spec[k]})
-      numeric_specs = numeric_specs ++ (for {k, {:int, _, _}} <- spec, do: {k, spec[k]})
+      numeric_specs = numeric_specs ++ for {k, {:log_uniform, _, _}} <- spec, do: {k, spec[k]}
+      numeric_specs = numeric_specs ++ for {k, {:int, _, _}} <- spec, do: {k, spec[k]}
       choice_specs = for {k, {:choice, _}} <- spec, do: {k, spec[k]}
-      
+
       # Use TPE for categorical parameters too
-      choice_params = if length(history) < state.min_obs do
-        # Random sampling during startup
-        Map.new(choice_specs, fn {k, {:choice, choices}} ->
-          {k, Enum.random(choices)}
-        end)
-      else
-        # TPE-based categorical sampling
-        sample_categorical_tpe(choice_specs, history, state)
-      end
-      
+      choice_params =
+        if length(history) < state.min_obs do
+          # Random sampling during startup
+          Map.new(choice_specs, fn {k, {:choice, choices}} ->
+            {k, Enum.random(choices)}
+          end)
+        else
+          # TPE-based categorical sampling
+          sample_categorical_tpe(choice_specs, history, state)
+        end
+
       # TPE for numeric parameters
       if numeric_specs == [] do
         # No numeric params, just return random choices
@@ -69,56 +74,66 @@ defmodule Scout.Sampler.TPE do
         numeric_keys = Keyword.keys(numeric_specs)
         obs = for t <- history, is_number(t.score), do: {t.params, t.score}
         dists = Map.new(numeric_keys, fn k -> {k, build_kdes(k, obs, state)} end)
-        
-        # Generate candidates
-        cand =
-          for _ <- 1..state.n_candidates do
-            Enum.reduce(numeric_keys, choice_params, fn k, acc ->
-              case spec[k] do
-                {:uniform, a, b} ->
-                  %{good: g} = Map.get(dists, k, %{good: %{xs: [], sigmas: []}, range: {a, b}})
-                  {mu, si} = pick_component(g, rng_state)
-                  {x, new_rng_state} = :rand.normal_s(mu, si, rng_state)
-                  rng_state = new_rng_state
-                  x = clamp(x, a, b)
-                  Map.put(acc, k, x)
-                {:log_uniform, a, b} ->
-                  # Sample in log space
-                  log_a = :math.log(a)
-                  log_b = :math.log(b)
-                  %{good: g} = Map.get(dists, k, %{good: %{xs: [], sigmas: []}, range: {log_a, log_b}})
-                  {mu, si} = pick_component(g, rng_state)
-                  {log_x, new_rng_state} = :rand.normal_s(mu, si, rng_state)
-                  rng_state = new_rng_state
-                  log_x = clamp(log_x, log_a, log_b)
-                  Map.put(acc, k, :math.exp(log_x))
-                {:int, a, b} ->
-                  # Sample as continuous then round
-                  %{good: g} = Map.get(dists, k, %{good: %{xs: [], sigmas: []}, range: {a, b}})
-                  {mu, si} = pick_component(g, rng_state)
-                  {x, new_rng_state} = :rand.normal_s(mu, si, rng_state)
-                  rng_state = new_rng_state
-                  x = clamp(x, a, b)
-                  Map.put(acc, k, round(x))
-                _ ->
-                  acc
-              end
-            end)
-          end
-        
-        # Select best candidate using acquisition function (EI proxy)
-        best = if cand == [] do
-          choice_params
-        else
-          # Score candidates by ratio of good/bad likelihood (Expected Improvement)
-          scored = Enum.map(cand, fn c ->
-            score = ei_score(c, numeric_keys, dists)
-            {c, score}
+
+        # Generate candidates while threading RNG state
+        {cand, rng_state} =
+          Enum.map_reduce(1..state.n_candidates, rng_state, fn _, rng_acc ->
+            {candidate, next_rng} =
+              Enum.reduce(numeric_keys, {choice_params, rng_acc}, fn k, {acc, inner_rng} ->
+                case spec[k] do
+                  {:uniform, a, b} ->
+                    %{good: g} = Map.get(dists, k, %{good: %{xs: [], sigmas: []}, range: {a, b}})
+                    {mu, si} = pick_component(g, inner_rng)
+                    {x, new_rng_state} = :rand.normal_s(mu, si, inner_rng)
+                    x = clamp(x, a, b)
+                    {Map.put(acc, k, x), new_rng_state}
+
+                  {:log_uniform, a, b} ->
+                    # Sample in log space
+                    log_a = :math.log(a)
+                    log_b = :math.log(b)
+
+                    %{good: g} =
+                      Map.get(dists, k, %{good: %{xs: [], sigmas: []}, range: {log_a, log_b}})
+
+                    {mu, si} = pick_component(g, inner_rng)
+                    {log_x, new_rng_state} = :rand.normal_s(mu, si, inner_rng)
+                    log_x = clamp(log_x, log_a, log_b)
+                    {Map.put(acc, k, :math.exp(log_x)), new_rng_state}
+
+                  {:int, a, b} ->
+                    # Sample as continuous then round
+                    %{good: g} = Map.get(dists, k, %{good: %{xs: [], sigmas: []}, range: {a, b}})
+                    {mu, si} = pick_component(g, inner_rng)
+                    {x, new_rng_state} = :rand.normal_s(mu, si, inner_rng)
+                    x = clamp(x, a, b)
+                    {Map.put(acc, k, round(x)), new_rng_state}
+
+                  _ ->
+                    {acc, inner_rng}
+                end
+              end)
+
+            {candidate, next_rng}
           end)
-          # Higher EI score = better expected improvement
-          {best_cand, _} = Enum.max_by(scored, fn {_, s} -> s end)
-          best_cand
-        end
+
+        # Select best candidate using acquisition function (EI proxy)
+        best =
+          if cand == [] do
+            choice_params
+          else
+            # Score candidates by ratio of good/bad likelihood (Expected Improvement)
+            scored =
+              Enum.map(cand, fn c ->
+                score = ei_score(c, numeric_keys, dists)
+                {c, score}
+              end)
+
+            # Higher EI score = better expected improvement
+            {best_cand, _} = Enum.max_by(scored, fn {_, s} -> s end)
+            best_cand
+          end
+
         {best, Map.put(state, :rng_state, rng_state)}
       end
     end
@@ -130,23 +145,25 @@ defmodule Scout.Sampler.TPE do
         :minimize -> Enum.sort_by(obs, fn {_p, s} -> s end, :asc)
         _ -> Enum.sort_by(obs, fn {_p, s} -> s end, :desc)
       end
+
     n = max(length(sorted), 1)
     n_good = max(trunc(state.gamma * n), 1)
     {good, bad} = Enum.split(sorted, n_good)
-    gvals = Enum.map(good, fn {p,_} -> Map.get(p,k) end) |> Enum.filter(&is_number/1)
-    bvals = Enum.map(bad,  fn {p,_} -> Map.get(p,k) end) |> Enum.filter(&is_number/1)
+    gvals = Enum.map(good, fn {p, _} -> Map.get(p, k) end) |> Enum.filter(&is_number/1)
+    bvals = Enum.map(bad, fn {p, _} -> Map.get(p, k) end) |> Enum.filter(&is_number/1)
     range = infer_range(gvals ++ bvals)
     %{range: range, good: kde(gvals, range), bad: kde(bvals, range)}
   end
 
-  defp kde([], {a,b}), do: %{xs: [0.5*(a+b)], sigmas: [max(1.0e-3,(b-a)*0.1)]}
-  defp kde(xs, {a,b}) do
+  defp kde([], {a, b}), do: %{xs: [0.5 * (a + b)], sigmas: [max(1.0e-3, (b - a) * 0.1)]}
+
+  defp kde(xs, {a, b}) do
     n = length(xs)
-    m = Enum.sum(xs)/n
-    var = Enum.reduce(xs, 0.0, fn x, acc -> acc + :math.pow(x-m,2) end) / max(n-1,1)
+    m = Enum.sum(xs) / n
+    var = Enum.reduce(xs, 0.0, fn x, acc -> acc + :math.pow(x - m, 2) end) / max(n - 1, 1)
     std = :math.sqrt(max(var, 1.0e-12))
     # Use Scott's rule more precisely: h = 1.06 * sigma * n^(-1/5)
-    sigma = max(1.06*std*(:math.pow(n, -0.2)), (b-a)*1.0e-3)
+    sigma = max(1.06 * std * :math.pow(n, -0.2), (b - a) * 1.0e-3)
     %{xs: xs, sigmas: Enum.map(xs, fn _ -> sigma end)}
   end
 
@@ -158,19 +175,24 @@ defmodule Scout.Sampler.TPE do
       pg = pdf(g, x) |> max(1.0e-12)
       pb = pdf(b, x) |> max(1.0e-12)
       # Higher ratio = more likely from good distribution
-      acc + :math.log(pg/pb)
+      acc + :math.log(pg / pb)
     end)
   end
 
   defp pdf(%{xs: xs, sigmas: sigmas}, x) do
     m = length(xs)
+
     if m == 0 do
       1.0e-9
     else
-      sum = Enum.zip(xs, sigmas)
-            |> Enum.reduce(0.0, fn {mu, si}, acc ->
-              acc + (1.0/(si*:math.sqrt(2.0*:math.pi()))) * :math.exp(-0.5 * :math.pow((x-mu)/si, 2))
-            end)
+      sum =
+        Enum.zip(xs, sigmas)
+        |> Enum.reduce(0.0, fn {mu, si}, acc ->
+          acc +
+            1.0 / (si * :math.sqrt(2.0 * :math.pi())) *
+              :math.exp(-0.5 * :math.pow((x - mu) / si, 2))
+        end)
+
       sum / m
     end
   end
@@ -183,7 +205,7 @@ defmodule Scout.Sampler.TPE do
       {Enum.at(xs, i - 1), Enum.at(sigmas, i - 1)}
     end
   end
-  
+
   # TPE-based categorical parameter sampling
   defp sample_categorical_tpe(choice_specs, history, state) do
     if choice_specs == [] do
@@ -193,37 +215,40 @@ defmodule Scout.Sampler.TPE do
       Map.new(choice_specs, fn {k, {:choice, choices}} ->
         # Build frequency distributions for good/bad groups
         obs = for t <- history, is_number(t.score), do: {Map.get(t.params, k), t.score}
-        
+
         if obs == [] do
           {k, Enum.random(choices)}
         else
           # Split into good/bad
-          sorted = case state.goal do
-            :minimize -> Enum.sort_by(obs, fn {_p, s} -> s end, :asc)
-            _ -> Enum.sort_by(obs, fn {_p, s} -> s end, :desc)
-          end
-          
+          sorted =
+            case state.goal do
+              :minimize -> Enum.sort_by(obs, fn {_p, s} -> s end, :asc)
+              _ -> Enum.sort_by(obs, fn {_p, s} -> s end, :desc)
+            end
+
           n = length(sorted)
           n_good = max(trunc(state.gamma * n), 1)
           {good, bad} = Enum.split(sorted, n_good)
-          
+
           # Count frequencies for each choice
           good_counts = count_categorical(good, choices)
           bad_counts = count_categorical(bad, choices)
-          
+
           # Calculate probabilities using Laplace smoothing
-          alpha = 1.0  # Laplace smoothing parameter
+          # Laplace smoothing parameter
+          alpha = 1.0
           good_total = Enum.sum(Map.values(good_counts)) + length(choices) * alpha
           bad_total = Enum.sum(Map.values(bad_counts)) + length(choices) * alpha
-          
+
           # Calculate EI score for each choice
-          scores = Enum.map(choices, fn choice ->
-            pg = (Map.get(good_counts, choice, 0) + alpha) / good_total
-            pb = (Map.get(bad_counts, choice, 0) + alpha) / bad_total
-            ei = pg / max(pb, 1.0e-12)
-            {choice, ei}
-          end)
-          
+          scores =
+            Enum.map(choices, fn choice ->
+              pg = (Map.get(good_counts, choice, 0) + alpha) / good_total
+              pb = (Map.get(bad_counts, choice, 0) + alpha) / bad_total
+              ei = pg / max(pb, 1.0e-12)
+              {choice, ei}
+            end)
+
           # Sample proportionally to EI scores
           selected = weighted_sample(scores)
           {k, selected}
@@ -231,11 +256,11 @@ defmodule Scout.Sampler.TPE do
       end)
     end
   end
-  
+
   # Count occurrences of each choice
   defp count_categorical(observations, choices) do
     counts = Map.new(choices, fn c -> {c, 0} end)
-    
+
     Enum.reduce(observations, counts, fn {param_val, _score}, acc ->
       if param_val in choices do
         Map.update(acc, param_val, 1, &(&1 + 1))
@@ -244,12 +269,12 @@ defmodule Scout.Sampler.TPE do
       end
     end)
   end
-  
+
   # Weighted sampling based on scores
   defp weighted_sample(choice_scores) do
     # Normalize scores to probabilities
     total = Enum.reduce(choice_scores, 0.0, fn {_, s}, acc -> acc + s end)
-    
+
     if total == 0 do
       # All scores are zero, sample uniformly
       {choice, _} = Enum.random(choice_scores)
@@ -257,26 +282,32 @@ defmodule Scout.Sampler.TPE do
     else
       # Build cumulative distribution
       r = :rand.uniform() * total
-      
-      {selected, _} = Enum.reduce_while(choice_scores, {nil, 0.0}, fn {choice, score}, {_, cum} ->
-        new_cum = cum + score
-        if new_cum >= r do
-          {:halt, {choice, new_cum}}
-        else
-          {:cont, {choice, new_cum}}
-        end
-      end)
-      
+
+      {selected, _} =
+        Enum.reduce_while(choice_scores, {nil, 0.0}, fn {choice, score}, {_, cum} ->
+          new_cum = cum + score
+
+          if new_cum >= r do
+            {:halt, {choice, new_cum}}
+          else
+            {:cont, {choice, new_cum}}
+          end
+        end)
+
       selected || elem(List.last(choice_scores), 0)
     end
   end
 
   defp infer_range([]), do: {0.0, 1.0}
+
   defp infer_range(xs) do
-    min = Enum.min(xs); max = Enum.max(xs); pad = (max-min)*0.05 + 1.0e-9
-    {min-pad, max+pad}
+    min = Enum.min(xs)
+    max = Enum.max(xs)
+    pad = (max - min) * 0.05 + 1.0e-9
+    {min - pad, max + pad}
   end
-  defp clamp(x,a,_b) when x<a, do: a
-  defp clamp(x,_a,b) when x>b, do: b
-  defp clamp(x,_a,_b), do: x
+
+  defp clamp(x, a, _b) when x < a, do: a
+  defp clamp(x, _a, b) when x > b, do: b
+  defp clamp(x, _a, _b), do: x
 end

@@ -37,9 +37,10 @@ defmodule ScoutCore.MixProject do
       {:telemetry_metrics, "~> 0.6"},
       {:telemetry_poller, "~> 1.0"},
       {:jason, "~> 1.2"},
-      
+
       # Dev/Test
       {:ex_doc, "~> 0.27", only: :dev, runtime: false},
+      {:stream_data, "~> 1.0", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.3", only: [:dev], runtime: false}
     ]

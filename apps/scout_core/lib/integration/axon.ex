@@ -1,21 +1,21 @@
 defmodule Scout.Integration.Axon do
   @moduledoc """
   Integration with Axon neural network library for Elixir.
-  
+
   Provides hyperparameter optimization for:
   - Network architecture (layers, units, activation functions)
   - Training parameters (learning rate, batch size, epochs)
   - Regularization (dropout, weight decay)
   - Optimizers (Adam, SGD, RMSprop parameters)
   """
-  
+
   alias Scout.{Study, Trial}
-  
+
   @doc """
   Optimizes Axon model hyperparameters.
-  
+
   ## Example
-  
+
       def create_model(params) do
         Axon.input("input", shape: {nil, 784})
         |> Axon.dense(params[:hidden1_units], activation: params[:activation1])
@@ -61,33 +61,35 @@ defmodule Scout.Integration.Axon do
     pruner = Keyword.get(opts, :pruner)
     sampler = Keyword.get(opts, :sampler, Scout.Sampler.TPE)
     metric = Keyword.get(opts, :metric, :accuracy)
-    
+
     objective = fn trial ->
       # Sample hyperparameters
       params = sample_params(trial, search_space)
-      
+
       # Create model
       model = model_fn.(params)
-      
+
       # Train with pruning support
-      result = train_with_pruning(
-        model, 
-        params, 
-        train_data, 
-        val_data,
-        train_fn,
-        trial,
-        metric
-      )
-      
+      result =
+        train_with_pruning(
+          model,
+          params,
+          train_data,
+          val_data,
+          train_fn,
+          trial,
+          metric
+        )
+
       result
     end
-    
+
     study = %Study{
       id: "axon_optimization_#{System.unique_integer([:positive])}",
       goal: direction,
       max_trials: n_trials,
-      parallelism: 1,  # Add required field
+      # Add required field
+      parallelism: 1,
       search_space: fn _ix -> search_space end,
       objective: objective,
       sampler: sampler,
@@ -96,41 +98,45 @@ defmodule Scout.Integration.Axon do
       pruner_opts: %{},
       metadata: %{framework: "axon"}
     }
-    
+
     Scout.run(study)
   end
-  
+
   defp sample_params(trial, search_space) do
     for {param_name, spec} <- search_space, into: %{} do
-      value = case spec do
-        {:uniform, min, max} ->
-          Trial.suggest_float(trial, param_name, min, max)
-        {:log_uniform, min, max} ->
-          Trial.suggest_float(trial, param_name, min, max, log: true)
-        {:int, min, max} ->
-          Trial.suggest_int(trial, param_name, min, max)
-        {:choice, choices} ->
-          Trial.suggest_categorical(trial, param_name, choices)
-      end
-      
+      value =
+        case spec do
+          {:uniform, min, max} ->
+            Trial.suggest_float(trial, param_name, min, max)
+
+          {:log_uniform, min, max} ->
+            Trial.suggest_float(trial, param_name, min, max, log: true)
+
+          {:int, min, max} ->
+            Trial.suggest_int(trial, param_name, min, max)
+
+          {:choice, choices} ->
+            Trial.suggest_categorical(trial, param_name, choices)
+        end
+
       {param_name, value}
     end
   end
-  
+
   defp train_with_pruning(model, params, train_data, val_data, train_fn, trial, metric) do
     # Custom training loop with intermediate reporting
     epochs = Map.get(params, :epochs, 10)
-    
+
     Enum.reduce_while(1..epochs, nil, fn epoch, _acc ->
       # Train for one epoch
-      epoch_result = train_single_epoch(model, params, train_data, train_fn)
-      
+      _ = train_single_epoch(model, params, train_data, train_fn)
+
       # Evaluate on validation set
       val_metric = evaluate(model, val_data, metric)
-      
+
       # Report intermediate value
       Trial.report(trial, val_metric, epoch)
-      
+
       # Check for pruning
       if Trial.should_prune?(trial) do
         {:halt, :pruned}
@@ -143,22 +149,22 @@ defmodule Scout.Integration.Axon do
       end
     end)
   end
-  
+
   defp train_single_epoch(_model, _params, _train_data, _train_fn) do
     # Placeholder - would integrate with actual Axon training
     %{loss: :rand.uniform()}
   end
-  
+
   defp evaluate(_model, _val_data, _metric) do
     # Placeholder - would integrate with actual Axon evaluation
     :rand.uniform()
   end
-  
+
   @doc """
   Pruning callback for Axon training loops.
-  
+
   Use this in your Axon.Loop to enable pruning during training:
-  
+
       loop
       |> Axon.Loop.handle_event(:epoch_completed, 
            &Scout.Integration.Axon.pruning_callback(&1, &2, trial))
@@ -166,11 +172,11 @@ defmodule Scout.Integration.Axon do
   def pruning_callback(state, _metadata, trial) do
     # Extract metric from state
     metric_value = get_in(state, [:metrics, :validation, :accuracy])
-    
+
     # Report to trial
     epoch = Map.get(state, :epoch, 0)
     Trial.report(trial, metric_value, epoch)
-    
+
     # Check for pruning
     if Trial.should_prune?(trial) do
       {:halt_loop, state}
@@ -178,17 +184,21 @@ defmodule Scout.Integration.Axon do
       {:continue, state}
     end
   end
-  
+
   @doc """
   Suggests optimal architecture based on dataset characteristics.
   """
   def suggest_architecture(input_shape, output_shape, task_type \\ :classification) do
-    input_size = elem(input_shape, -1)
-    output_size = case output_shape do
-      n when is_integer(n) -> n
-      shape when is_tuple(shape) -> elem(shape, -1)
-    end
-    
+    input_size = last_dim(input_shape)
+
+    output_size =
+      case output_shape do
+        n when is_integer(n) -> n
+        shape when is_tuple(shape) -> last_dim(shape)
+        shape when is_list(shape) -> last_dim(shape)
+        _ -> 1
+      end
+
     case task_type do
       :classification ->
         %{
@@ -197,7 +207,7 @@ defmodule Scout.Integration.Axon do
           dropout: 0.2,
           output_activation: if(output_size == 1, do: :sigmoid, else: :softmax)
         }
-        
+
       :regression ->
         %{
           hidden_layers: suggest_hidden_layers(input_size, output_size),
@@ -205,7 +215,7 @@ defmodule Scout.Integration.Axon do
           dropout: 0.1,
           output_activation: :linear
         }
-        
+
       :autoencoder ->
         %{
           encoder_layers: suggest_encoder_layers(input_size),
@@ -215,21 +225,23 @@ defmodule Scout.Integration.Axon do
         }
     end
   end
-  
+
   defp suggest_hidden_layers(input_size, output_size) do
     # Rule of thumb: geometric mean for first hidden layer
     first_layer = round(:math.sqrt(input_size * output_size))
-    
+
     cond do
       input_size < 100 ->
         [first_layer]
+
       input_size < 1000 ->
         [first_layer, round(first_layer / 2)]
+
       true ->
         [first_layer, round(first_layer / 2), round(first_layer / 4)]
     end
   end
-  
+
   defp suggest_encoder_layers(input_size) do
     [
       round(input_size / 2),
@@ -238,13 +250,31 @@ defmodule Scout.Integration.Axon do
     ]
     |> Enum.filter(&(&1 > 10))
   end
-  
+
   defp suggest_decoder_layers(input_size) do
     suggest_encoder_layers(input_size)
     |> Enum.reverse()
   end
-  
+
   defp suggest_latent_dim(input_size) do
     max(2, round(:math.log2(input_size)))
   end
+
+  defp last_dim(shape) when is_integer(shape), do: shape
+
+  defp last_dim(shape) when is_tuple(shape) do
+    case tuple_size(shape) do
+      0 -> 0
+      size -> elem(shape, size - 1)
+    end
+  end
+
+  defp last_dim(shape) when is_list(shape) do
+    case Enum.reverse(shape) do
+      [last | _] -> last
+      _ -> 0
+    end
+  end
+
+  defp last_dim(_), do: 0
 end

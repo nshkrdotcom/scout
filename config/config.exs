@@ -1,4 +1,3 @@
-
 import Config
 
 # Configure Ecto and database for Scout persistence
@@ -10,7 +9,7 @@ config :scout_core, Scout.Repo,
   hostname: "localhost",
   pool_size: 10
 
-config :scout_core, 
+config :scout_core,
   ecto_repos: [Scout.Repo],
   # Storage adapter: Scout.Store.Postgres (recommended for production)
   # Use Scout.Store.ETS for testing/development without DB
@@ -35,7 +34,7 @@ config :scout_dashboard, ScoutDashboardWeb.Endpoint,
 
 if config_env() == :dev do
   config :scout_dashboard, ScoutDashboardWeb.Endpoint,
-    http: [ip: {127,0,0,1}, port: 4050],
+    http: [ip: {127, 0, 0, 1}, port: 4050],
     debug_errors: true,
     code_reloader: true,
     check_origin: false,
@@ -45,6 +44,13 @@ end
 if config_env() == :prod do
   config :scout_dashboard, ScoutDashboardWeb.Endpoint,
     url: [host: System.get_env("HOST", "example.com"), port: 443],
-    http: [ip: {0,0,0,0}, port: String.to_integer(System.get_env("PORT") || "4050")],
+    http: [ip: {0, 0, 0, 0}, port: String.to_integer(System.get_env("PORT") || "4050")],
     secret_key_base: System.get_env("SECRET_KEY_BASE") || "CHANGE_ME"
+end
+
+# Import environment-specific overrides when available (dev/test/prod)
+env_config = Path.join(__DIR__, "#{config_env()}.exs")
+
+if File.exists?(env_config) do
+  import_config "#{config_env()}.exs"
 end
